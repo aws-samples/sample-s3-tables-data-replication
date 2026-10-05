@@ -18,6 +18,8 @@ Resources:
     Properties:
       TableName: !Sub ${ProjectName}-orders
       BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       AttributeDefinitions:

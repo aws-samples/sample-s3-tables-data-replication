@@ -108,8 +108,10 @@ resource "aws_secretsmanager_secret_version" "aurora" {
 
 # ============ Kinesis Data Stream ============
 resource "aws_kinesis_stream" "cdc" {
-  name        = "${var.project_name}-flow2-cdc"
-  shard_count = 2
+  name            = "${var.project_name}-flow2-cdc"
+  shard_count     = 2
+  encryption_type = "KMS"
+  kms_key_id      = "alias/aws/kinesis"
 }
 
 # ============ DMS ============

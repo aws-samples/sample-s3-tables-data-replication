@@ -118,8 +118,8 @@ Resources:
                   - s3tables:PutTableData
                   - s3tables:GetTableBucket
                 Resource:
-                  - !Sub arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/*
-                  - !Sub arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/*/table/*
+                  - !Sub arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${TableBucketName}
+                  - !Sub arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${TableBucketName}/*
               - Sid: GlueCatalog
                 Effect: Allow
                 Action:

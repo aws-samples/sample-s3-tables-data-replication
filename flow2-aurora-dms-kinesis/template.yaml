@@ -107,6 +107,9 @@ Resources:
       ShardCount: 2
       StreamModeDetails:
         StreamMode: PROVISIONED
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
 
   # ============ DMS ============
   DMSReplicationSubnetGroup:

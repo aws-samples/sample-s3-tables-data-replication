@@ -57,6 +57,7 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: 10.0.10.0/24
       AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
           Value: !Sub ${ProjectName}-private-1
@@ -67,6 +68,7 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: 10.0.11.0/24
       AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
       Tags:
         - Key: Name
           Value: !Sub ${ProjectName}-private-2
@@ -152,6 +154,8 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub ${ProjectName}-errors-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
