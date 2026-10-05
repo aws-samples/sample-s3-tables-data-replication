@@ -412,4 +412,4 @@ See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for information
 
 ## License
 
-This library is licensed under the Apache-2.0 License. See the [LICENSE](LICENSE) file.
+This sample code is made available under the MIT-0 license. See the [LICENSE](LICENSE) file.
