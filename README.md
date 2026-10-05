@@ -1,6 +1,10 @@
-# S3 Table Buckets Data Replication Workshop
+# Amazon S3 Table Buckets Data Replication Samples
 
 Three sample flows demonstrating different ways to replicate data into Amazon S3 Table Buckets (Apache Iceberg).
+
+> **Sample code — not for production.** This repository is AWS sample code intended to demonstrate
+> data-replication patterns into Amazon S3 Table Buckets. It is provided for educational purposes
+> and must be reviewed, hardened, and tested before any production use.
 
 ## Flows
 
