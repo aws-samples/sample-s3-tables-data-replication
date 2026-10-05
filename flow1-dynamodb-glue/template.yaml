@@ -1,0 +1,134 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Flow 1: DynamoDB -> Glue Zero-ETL -> S3 Tables.
+  Creates DynamoDB table with PITR, IAM role for Glue target, and Glue Zero-ETL integration.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: zero-etl-workshop
+  TableBucketName:
+    Type: String
+    Description: S3 Table Bucket name from shared stack
+
+Resources:
+  # ============ DynamoDB Source Table ============
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-orders
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: order_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: order_id
+          KeyType: HASH
+      # Resource-based policy granting Glue Zero-ETL access to the SOURCE table. Without this
+      # the integration goes NEEDS_ATTENTION with DESCRIBE_TABLE_RESOURCE_POLICY_RECOVERABLE
+      # ("Glue is not authorized to perform DescribeTable on source DynamoDB table"). Matches
+      # the Terraform aws_dynamodb_resource_policy.glue_access. Scoped to this account and to
+      # Glue integration source ARNs.
+      ResourcePolicy:
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: AllowGlueZeroETL
+              Effect: Allow
+              Principal:
+                Service: glue.amazonaws.com
+              Action:
+                - dynamodb:ExportTableToPointInTime
+                - dynamodb:DescribeTable
+                - dynamodb:DescribeExport
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  aws:SourceAccount: !Ref AWS::AccountId
+                ArnLike:
+                  aws:SourceArn: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:integration:*
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============ Glue Target IAM Role ============
+  GlueTargetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-flow1-glue-target
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GlueTargetPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: GlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:CreateDatabase
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog/${TableBucketName}
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog/${TableBucketName}/database/zetl_*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog/${TableBucketName}/table/zetl_*/*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/zetl_*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/zetl_*/*
+              - Sid: S3Tables
+                Effect: Allow
+                # Glue Zero-ETL writes NEW tables into the target namespace, so (unlike the
+                # Firehose roles that only write to a pre-created table) this role additionally
+                # needs namespace read + table/namespace create actions. Omitting
+                # s3tables:GetNamespace causes the integration to go NEEDS_ATTENTION with
+                # TARGET_NAMESPACE_ACCESS_DENIED. Keep in parity with the Terraform flow1 role.
+                Action:
+                  - s3tables:GetTable
+                  - s3tables:GetTableData
+                  - s3tables:GetTableMetadataLocation
+                  - s3tables:UpdateTableMetadataLocation
+                  - s3tables:PutTableData
+                  - s3tables:GetTableBucket
+                  - s3tables:GetNamespace
+                  - s3tables:ListNamespaces
+                  - s3tables:ListTables
+                  - s3tables:CreateNamespace
+                  - s3tables:CreateTable
+                Resource:
+                  - !Sub arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${TableBucketName}
+                  - !Sub arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${TableBucketName}/*
+              - Sid: LakeFormation
+                Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: '*'
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*
+
+Outputs:
+  DynamoDBTableArn:
+    Value: !GetAtt OrdersTable.Arn
+  DynamoDBTableName:
+    Value: !Ref OrdersTable
+  GlueTargetRoleArn:
+    Value: !GetAtt GlueTargetRole.Arn

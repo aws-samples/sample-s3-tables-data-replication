@@ -1,0 +1,466 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Flow 2: Aurora PostgreSQL -> DMS -> Kinesis Data Streams -> Firehose -> S3 Tables.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: zero-etl-workshop
+  VpcId:
+    Type: String
+  PrivateSubnet1Id:
+    Type: String
+  PrivateSubnet2Id:
+    Type: String
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  TableBucketName:
+    Type: String
+  ErrorBucketArn:
+    Type: String
+  ErrorBucketName:
+    Type: String
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: >
+      Master DB password. No default is shipped. deploy.sh supplies it via
+      --parameter-overrides from the required DB_PASSWORD env var.
+
+Resources:
+  # ============ Security Groups ============
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora PostgreSQL access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref DMSSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-flow2-aurora-sg
+
+  # ============ Aurora PostgreSQL ============
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Flow 2 Aurora subnets
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+
+  AuroraParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Family: aurora-postgresql16
+      Description: Enable logical replication for DMS
+      Parameters:
+        rds.logical_replication: '1'
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      DBClusterIdentifier: !Sub ${ProjectName}-flow2-aurora
+      Engine: aurora-postgresql
+      # Major-version only (not a pinned patch like '16.6', which does not exist in every
+      # region, e.g. us-west-2): AWS resolves the latest supported 16.x minor in the deploy
+      # region. Keeps the CloudFormation path region-portable, matching the Terraform fix.
+      EngineVersion: '16'
+      MasterUsername: postgres
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      DBClusterParameterGroupName: !Ref AuroraParameterGroup
+      EnableHttpEndpoint: true
+      StorageEncrypted: true
+      DeletionProtection: false
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AuroraSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${ProjectName}-flow2-db-secret
+      SecretString: !Sub '{"username":"postgres","password":"${DBMasterPassword}"}'
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.r6g.large
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+
+  # ============ Kinesis Data Stream ============
+  KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub ${ProjectName}-flow2-cdc
+      ShardCount: 2
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+
+  # ============ DMS ============
+  DMSReplicationSubnetGroup:
+    Type: AWS::DMS::ReplicationSubnetGroup
+    Properties:
+      ReplicationSubnetGroupIdentifier: !Sub ${ProjectName}-flow2-dms
+      ReplicationSubnetGroupDescription: Flow 2 DMS subnets
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+
+  DMSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DMS replication instance
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-flow2-dms-sg
+
+  DMSReplicationInstance:
+    Type: AWS::DMS::ReplicationInstance
+    Properties:
+      ReplicationInstanceIdentifier: !Sub ${ProjectName}-flow2-dms
+      ReplicationInstanceClass: dms.r5.large
+      AllocatedStorage: 50
+      VpcSecurityGroupIds:
+        - !Ref DMSSecurityGroup
+        - !Ref AuroraSecurityGroup
+      ReplicationSubnetGroupIdentifier: !Ref DMSReplicationSubnetGroup
+      PubliclyAccessible: false
+
+  DMSKinesisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-flow2-dms-kinesis
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                  - kinesis:DescribeStream
+                Resource: !GetAtt KinesisStream.Arn
+
+  DMSSourceEndpoint:
+    Type: AWS::DMS::Endpoint
+    DependsOn: AuroraInstance
+    Properties:
+      EndpointIdentifier: !Sub ${ProjectName}-flow2-source
+      EndpointType: source
+      EngineName: aurora-postgresql
+      ServerName: !GetAtt AuroraCluster.Endpoint.Address
+      Port: 5432
+      DatabaseName: postgres
+      Username: postgres
+      Password: !Ref DBMasterPassword
+
+  DMSTargetEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub ${ProjectName}-flow2-target
+      EndpointType: target
+      EngineName: kinesis
+      KinesisSettings:
+        StreamArn: !GetAtt KinesisStream.Arn
+        ServiceAccessRoleArn: !GetAtt DMSKinesisRole.Arn
+        MessageFormat: json
+        IncludeTransactionDetails: true
+
+  DMSReplicationTask:
+    Type: AWS::DMS::ReplicationTask
+    Properties:
+      ReplicationTaskIdentifier: !Sub ${ProjectName}-flow2-task
+      ReplicationInstanceArn: !Ref DMSReplicationInstance
+      SourceEndpointArn: !Ref DMSSourceEndpoint
+      TargetEndpointArn: !Ref DMSTargetEndpoint
+      MigrationType: full-load-and-cdc
+      TableMappings: |
+        {
+          "rules": [
+            {
+              "rule-type": "selection",
+              "rule-id": "1",
+              "rule-name": "select-public-schema",
+              "object-locator": {
+                "schema-name": "public",
+                "table-name": "%"
+              },
+              "rule-action": "include"
+            }
+          ]
+        }
+      ReplicationTaskSettings: |
+        {
+          "TargetMetadata": {
+            "ParallelLoadThreads": 4,
+            "ParallelLoadBufferSize": 50
+          },
+          "Logging": {
+            "EnableLogging": true
+          }
+        }
+
+  # ============ Firehose ============
+  # NOTE: The Firehose delivery stream is created by deploy.sh AFTER
+  # sync-schema.py discovers Aurora tables and creates matching S3 Tables.
+  # This allows the DestinationTableConfigurationList to be built dynamically.
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-flow2-firehose
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehosePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: KinesisSource
+                Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !GetAtt KinesisStream.Arn
+              - Sid: GlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog/*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*/*
+              - Sid: S3Tables
+                Effect: Allow
+                Action:
+                  - s3tables:GetTable
+                  - s3tables:GetTableData
+                  - s3tables:GetTableMetadataLocation
+                  - s3tables:UpdateTableMetadataLocation
+                  - s3tables:PutTableData
+                  - s3tables:GetTableBucket
+                Resource:
+                  - !Sub arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${TableBucketName}
+                  - !Sub arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/${TableBucketName}/*
+              - Sid: LakeFormation
+                Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: '*'
+              - Sid: ErrorBucket
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Ref ErrorBucketArn
+                  - !Sub ${ErrorBucketArn}/*
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/firehose/${ProjectName}-flow2:*
+              - Sid: LambdaTransform
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource: !GetAtt TransformLambda.Arn
+
+  # ============ DMS Record Transform Lambda ============
+  # DMS wraps CDC records in {"data": {...}, "metadata": {...}}.
+  # This Lambda flattens them for Firehose Iceberg delivery.
+  TransformLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  TransformLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-flow2-transform
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt TransformLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import base64, json
+          def handler(event, context):
+            output = []
+            for record in event['records']:
+              payload = json.loads(base64.b64decode(record['data']).decode('utf-8'))
+              if 'data' in payload and payload.get('metadata', {}).get('record-type') == 'data':
+                flat = payload['data']
+                output.append({
+                  'recordId': record['recordId'],
+                  'result': 'Ok',
+                  'data': base64.b64encode((json.dumps(flat) + '\n').encode()).decode()
+                })
+              else:
+                output.append({'recordId': record['recordId'], 'result': 'Dropped', 'data': record['data']})
+            return {'records': output}
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/firehose/${ProjectName}-flow2
+      RetentionInDays: 7
+
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: DestinationDelivery
+
+  # ============ Lake Formation Permissions (Custom Resource) ============
+  LFGrantLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LFGrant
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lakeformation:GrantPermissions
+                  - lakeformation:RevokePermissions
+                Resource: '*'
+
+  LFGrantFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt LFGrantLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import urllib3
+          def send_response(event, context, status):
+            body = json.dumps({
+              'Status': status,
+              'Reason': 'See CloudWatch',
+              'PhysicalResourceId': context.log_stream_name,
+              'StackId': event['StackId'],
+              'RequestId': event['RequestId'],
+              'LogicalResourceId': event['LogicalResourceId'],
+              'Data': {}
+            })
+            urllib3.PoolManager().request('PUT', event['ResponseURL'], body=body, headers={'content-type': ''})
+          def handler(event, context):
+            try:
+              lf = boto3.client('lakeformation')
+              props = event['ResourceProperties']
+              params = {
+                'Principal': {'DataLakePrincipalIdentifier': props['PrincipalArn']},
+                'Resource': {'Table': {'CatalogId': props['CatalogId'], 'DatabaseName': props['DatabaseName'], 'TableWildcard': {}}},
+                'Permissions': ['SELECT', 'INSERT', 'ALTER', 'DESCRIBE']
+              }
+              if event['RequestType'] in ['Create', 'Update']:
+                try:
+                  lf.grant_permissions(**params)
+                except lf.exceptions.AlreadyExistsException:
+                  pass
+              elif event['RequestType'] == 'Delete':
+                try:
+                  lf.revoke_permissions(**params)
+                except:
+                  pass
+            except Exception as e:
+              print(e)
+            send_response(event, context, 'SUCCESS')
+
+  LFPermissionGrant:
+    Type: Custom::LFPermission
+    DependsOn: FirehoseRole
+    Properties:
+      ServiceToken: !GetAtt LFGrantFunction.Arn
+      PrincipalArn: !GetAtt FirehoseRole.Arn
+      CatalogId: !Sub ${AWS::AccountId}:s3tablescatalog/${TableBucketName}
+      DatabaseName: flow2_aurora
+
+Outputs:
+  AuroraEndpoint:
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+  AuroraPort:
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+  AuroraClusterArn:
+    Value: !GetAtt AuroraCluster.DBClusterArn
+  AuroraSecretArn:
+    Value: !Ref AuroraSecret
+  KinesisStreamName:
+    Value: !Ref KinesisStream
+  KinesisStreamArn:
+    Value: !GetAtt KinesisStream.Arn
+  DMSReplicationTaskArn:
+    Value: !Ref DMSReplicationTask
+  FirehoseRoleArn:
+    Value: !GetAtt FirehoseRole.Arn
+  FirehoseLogGroupName:
+    Value: !Ref FirehoseLogGroup
+  FirehoseLogStreamName:
+    Value: !Ref FirehoseLogStream
+  TransformLambdaArn:
+    Value: !GetAtt TransformLambda.Arn

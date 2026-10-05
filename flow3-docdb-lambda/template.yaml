@@ -1,0 +1,457 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Flow 3: DocumentDB -> Change Streams -> Lambda -> Firehose -> S3 Tables.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: zero-etl-workshop
+  VpcId:
+    Type: String
+  PrivateSubnet1Id:
+    Type: String
+  PrivateSubnet2Id:
+    Type: String
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  TableBucketName:
+    Type: String
+  ErrorBucketArn:
+    Type: String
+  ErrorBucketName:
+    Type: String
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: >
+      Master DB password. No default is shipped. deploy.sh supplies it via
+      --parameter-overrides from the required DB_PASSWORD env var.
+
+Resources:
+  # ============ Security Groups ============
+  DocDBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DocumentDB access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 27017
+          ToPort: 27017
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-flow3-docdb-sg
+
+  # ============ DocumentDB ============
+  DocDBSubnetGroup:
+    Type: AWS::DocDB::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Flow 3 DocumentDB subnets
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+
+  DocDBParameterGroup:
+    Type: AWS::DocDB::DBClusterParameterGroup
+    Properties:
+      Family: docdb5.0
+      Description: Enable change streams
+      Parameters:
+        change_stream_log_retention_duration: '10800'
+
+  DocDBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${ProjectName}-flow3-docdb-secret
+      SecretString: !Sub '{"username":"docdbadmin","password":"${DBMasterPassword}"}'
+
+  DocDBCluster:
+    Type: AWS::DocDB::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      DBClusterIdentifier: !Sub ${ProjectName}-flow3-docdb
+      MasterUsername: docdbadmin
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref DocDBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DocDBSecurityGroup
+      DBClusterParameterGroupName: !Ref DocDBParameterGroup
+      StorageEncrypted: true
+      DeletionProtection: false
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DocDBInstance:
+    Type: AWS::DocDB::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DocDBCluster
+      DBInstanceClass: db.r6g.large
+
+  # ============ Firehose ============
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-flow3-firehose
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehosePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3TablesAccess
+                Effect: Allow
+                Action:
+                  - s3tables:GetTable
+                  - s3tables:GetTableData
+                  - s3tables:GetTableMetadataLocation
+                  - s3tables:UpdateTableMetadataLocation
+                  - s3tables:PutTableData
+                  - s3tables:GetTableBucket
+                Resource:
+                  - !Sub arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/*
+                  - !Sub arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/*/table/*
+              - Sid: GlueCatalog
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog/*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*/*
+              - Sid: LakeFormation
+                Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: '*'
+              - Sid: ErrorBucket
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Ref ErrorBucketArn
+                  - !Sub ${ErrorBucketArn}/*
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/firehose/${ProjectName}-flow3:*
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/firehose/${ProjectName}-flow3
+      RetentionInDays: 7
+
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: DestinationDelivery
+
+  # ============ Lake Formation Permissions (Custom Resource) ============
+  LFGrantLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LFGrant
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lakeformation:GrantPermissions
+                  - lakeformation:RevokePermissions
+                Resource: '*'
+
+  LFGrantFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt LFGrantLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import urllib3
+          def send_response(event, context, status):
+            body = json.dumps({
+              'Status': status,
+              'Reason': 'See CloudWatch',
+              'PhysicalResourceId': context.log_stream_name,
+              'StackId': event['StackId'],
+              'RequestId': event['RequestId'],
+              'LogicalResourceId': event['LogicalResourceId'],
+              'Data': {}
+            })
+            urllib3.PoolManager().request('PUT', event['ResponseURL'], body=body, headers={'content-type': ''})
+          def handler(event, context):
+            try:
+              lf = boto3.client('lakeformation')
+              props = event['ResourceProperties']
+              params = {
+                'Principal': {'DataLakePrincipalIdentifier': props['PrincipalArn']},
+                'Resource': {'Table': {'CatalogId': props['CatalogId'], 'DatabaseName': props['DatabaseName'], 'TableWildcard': {}}},
+                'Permissions': ['SELECT', 'INSERT', 'ALTER', 'DESCRIBE']
+              }
+              if event['RequestType'] in ['Create', 'Update']:
+                try:
+                  lf.grant_permissions(**params)
+                except lf.exceptions.AlreadyExistsException:
+                  pass
+              elif event['RequestType'] == 'Delete':
+                try:
+                  lf.revoke_permissions(**params)
+                except:
+                  pass
+            except Exception as e:
+              print(e)
+            send_response(event, context, 'SUCCESS')
+
+  LFPermissionGrant:
+    Type: Custom::LFPermission
+    DependsOn: FirehoseRole
+    Properties:
+      ServiceToken: !GetAtt LFGrantFunction.Arn
+      PrincipalArn: !GetAtt FirehoseRole.Arn
+      CatalogId: !Sub ${AWS::AccountId}:s3tablescatalog/${TableBucketName}
+      DatabaseName: flow3_docdb
+
+  # ============ Lambda (Change Stream Processor) ============
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda to DocumentDB
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-flow3-lambda-sg
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-flow3-lambda
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Firehose
+                Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !Sub arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${ProjectName}-flow3-firehose
+              - Sid: SecretsManager
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DocDBSecret
+              - Sid: DocDBDescribe
+                Effect: Allow
+                Action:
+                  - rds:DescribeDBClusters
+                  - rds:DescribeDBClusterParameters
+                  - rds:DescribeDBSubnetGroups
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                Resource: '*'
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-flow3-processor:*
+
+  ChangeStreamProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-flow3-processor
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt LambdaRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      Environment:
+        Variables:
+          FIREHOSE_STREAM_NAME: !Sub ${ProjectName}-flow3-firehose
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          firehose = boto3.client('firehose')
+          STREAM = os.environ['FIREHOSE_STREAM_NAME']
+
+          def handler(event, context):
+            records = []
+            for record in event.get('events', []):
+              doc = record.get('event', {})
+              op = doc.get('operationType', 'insert')
+              full_doc = doc.get('fullDocument', {})
+              # Convert ObjectId and other BSON types to strings
+              cleaned = {}
+              for k, v in full_doc.items():
+                if isinstance(v, dict):
+                  cleaned[k] = str(v)
+                else:
+                  cleaned[k] = v
+              # Remove _id field (not compatible with Iceberg)
+              cleaned.pop('_id', None)
+              if cleaned:
+                records.append({'Data': json.dumps(cleaned) + '\n'})
+
+            if records:
+              # Firehose PutRecordBatch max 500 records
+              for i in range(0, len(records), 500):
+                batch = records[i:i+500]
+                firehose.put_record_batch(
+                  DeliveryStreamName=STREAM,
+                  Records=batch
+                )
+              print(f'Sent {len(records)} records to Firehose')
+            return {'statusCode': 200}
+
+  # ============ Enable Change Streams (Custom Resource) ============
+  EnableChangeStreamsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DocDBInstance
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 256
+      Role: !GetAtt LambdaRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref DocDBSecret
+          DOCDB_ENDPOINT: !GetAtt DocDBCluster.Endpoint
+      Code:
+        ZipFile: |
+          import json, os, urllib.request, subprocess, sys, urllib3
+          def send_response(event, context, status):
+            body = json.dumps({'Status': status, 'Reason': 'See CloudWatch',
+              'PhysicalResourceId': context.log_stream_name,
+              'StackId': event['StackId'], 'RequestId': event['RequestId'],
+              'LogicalResourceId': event['LogicalResourceId'], 'Data': {}})
+            urllib3.PoolManager().request('PUT', event['ResponseURL'], body=body, headers={'content-type': ''})
+          def handler(event, context):
+            if event['RequestType'] == 'Delete':
+              send_response(event, context, 'SUCCESS')
+              return
+            try:
+              subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pymongo', '-t', '/tmp/pip', '-q'])
+              sys.path.insert(0, '/tmp/pip')
+              import pymongo
+              sm = __import__('boto3').client('secretsmanager')
+              secret = json.loads(sm.get_secret_value(SecretId=os.environ['SECRET_ARN'])['SecretString'])
+              urllib.request.urlretrieve('https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem', '/tmp/ca.pem')
+              client = pymongo.MongoClient(
+                f"mongodb://{secret['username']}:{secret['password']}@{os.environ['DOCDB_ENDPOINT']}:27017/"
+                "?tls=true&tlsCAFile=/tmp/ca.pem&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false")
+              client.admin.command({'modifyChangeStreams': 1, 'database': 'workshop', 'collection': '', 'enable': True})
+              print('Change streams enabled')
+            except Exception as e:
+              print(e)
+            send_response(event, context, 'SUCCESS')
+
+  EnableChangeStreams:
+    Type: Custom::EnableChangeStreams
+    DependsOn: DocDBInstance
+    Properties:
+      ServiceToken: !GetAtt EnableChangeStreamsFunction.Arn
+
+  EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn:
+      - DocDBInstance
+      - EnableChangeStreams
+    Properties:
+      EventSourceArn: !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DocDBCluster}
+      FunctionName: !GetAtt ChangeStreamProcessor.Arn
+      SourceAccessConfigurations:
+        - Type: BASIC_AUTH
+          URI: !Ref DocDBSecret
+      DocumentDBEventSourceConfig:
+        DatabaseName: workshop
+        CollectionName: products
+        FullDocument: UpdateLookup
+      StartingPosition: LATEST
+      BatchSize: 100
+      Enabled: true
+
+Outputs:
+  DocDBClusterEndpoint:
+    Value: !GetAtt DocDBCluster.Endpoint
+  DocDBClusterPort:
+    Value: !GetAtt DocDBCluster.Port
+  DocDBClusterArn:
+    Value: !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DocDBCluster}
+  DocDBSecretArn:
+    Value: !Ref DocDBSecret
+  FirehoseRoleArn:
+    Value: !GetAtt FirehoseRole.Arn
+  FirehoseLogGroupName:
+    Value: !Ref FirehoseLogGroup
+  FirehoseLogStreamName:
+    Value: !Ref FirehoseLogStream
+  LambdaFunctionName:
+    Value: !Ref ChangeStreamProcessor
