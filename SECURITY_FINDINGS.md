@@ -96,11 +96,27 @@ otherwise tighten `aws:SourceArn` to the specific integration ARN once it is kno
 
 ---
 
-## 5. Bandit B608 — SQL built with string construction (`sync-schema.py`)
+## 5. Bandit B608 — SQL built with string construction (false positives after parameterization)
 
 | Scanner | Rule ID | File | Specific justification |
 |---------|---------|------|------------------------|
-| Bandit | **B608** | `flow2-aurora-dms-kinesis/sync-schema.py` (information_schema discovery queries, ~lines 93/112/120) | Accepted. The queries that drive S3 Tables schema discovery read `information_schema` filtered by schema and table name. Those filter values come **only from the script's own trusted sources** — the `--schema` CLI argument (default `public`) and table names the script itself discovered from `information_schema` moments earlier — **never from external or end-user input**. The literal filter values are bound as **RDS Data API named parameters** (`:schema`, `:table`) rather than concatenated, so no row/value data is interpolated into SQL. Any remaining query text is fixed SQL plus these trusted, parameterized identifiers; the Bandit string-construction pattern is a false positive in this trusted-input, non-production context. |
+| Bandit | **B608** | `flow2-aurora-dms-kinesis/sync-schema.py` (information_schema discovery queries, ~lines 93/112/120) | Accepted / false positive. The queries that drive S3 Tables schema discovery read `information_schema` filtered by schema and table name. Those filter values come **only from the script's own trusted sources** — the `--schema` CLI argument (default `public`) and table names the script itself discovered from `information_schema` moments earlier — **never from external or end-user input**. The filter values are bound as **RDS Data API named parameters** (`:schema`, `:table`), so no value is interpolated into SQL. |
+| Bandit | **B608** | `flow2-aurora-dms-kinesis/load-data.py` (customers `INSERT`, ~line 96) | **False positive.** The `INSERT INTO customers ... VALUES {','.join(placeholders)}` f-string interpolates **only parameter-placeholder tokens** (`:fn{i}`, `:ln{i}`, …), never data. Every actual row value is bound via the RDS Data API `parameters` list (`stringValue`/`longValue`/`doubleValue`). Bandit's heuristic cannot distinguish an f-string that builds placeholder names from one that concatenates data; there is no injectable value here. |
 
 **Production guidance:** if these queries are ever fed values from an untrusted caller, validate the
 identifiers against an allowlist derived from `information_schema` before use.
+
+---
+
+## 6. Findings that the scanner reports but the current code already satisfies (false positives)
+
+These appear in the Slingshot CSR export but are **already handled in the committed code**; they are
+scanner limitations (resource-association or heuristic), not open issues.
+
+| Scanner | Rule ID | Where | Why it is a false positive |
+|---------|---------|-------|----------------------------|
+| cfn-guard | **S3_BUCKET_SSL_REQUESTS_ONLY** | shared error bucket (`shared/template.yaml`) | A TLS-only bucket policy **is present** — `ErrorBucketPolicy` (`AWS::S3::BucketPolicy`) with a `DenyInsecureTransport` statement: `Effect: Deny`, `Principal: '*'`, `Action: s3:*`, `Condition { Bool { aws:SecureTransport: false } }` over the bucket ARN and `/*`. The scanner evaluates the `AWS::S3::Bucket` resource in isolation and does not associate the separate `BucketPolicy` resource with it. The control is implemented. The Terraform path has the equivalent `aws_s3_bucket_policy` deny. |
+| Checkov | **CKV_AWS_130** | shared VPC **public** subnets (`terraform/shared/main.tf` lines 34/42; CFN equivalent) | Accepted by design. These two findings are against the **public** subnets, which **must** auto-assign public IPs because they host the NAT gateway and the internet-facing path for the private subnets. The **private** subnets (where the databases/Lambdas live) were set to `map_public_ip_on_launch = false` in the hardening pass. Flagging the public subnets is expected; it is not a misconfiguration. |
+
+**Production guidance:** none required — the TLS policy is enforced, and public subnets legitimately
+need public IP assignment for the NAT/ingress path. Private subnets already have it disabled.
