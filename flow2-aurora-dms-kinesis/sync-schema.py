@@ -45,11 +45,14 @@ def get_output(cfn, stack, key):
     raise KeyError(f"{key} not found in {stack}")
 
 
-def query(rds_data, cluster_arn, secret_arn, sql):
-    resp = rds_data.execute_statement(
-        resourceArn=cluster_arn, secretArn=secret_arn,
-        database=DB_NAME, sql=sql, includeResultMetadata=True,
-    )
+def query(rds_data, cluster_arn, secret_arn, sql, parameters=None):
+    kwargs = {
+        "resourceArn": cluster_arn, "secretArn": secret_arn,
+        "database": DB_NAME, "sql": sql, "includeResultMetadata": True,
+    }
+    if parameters is not None:
+        kwargs["parameters"] = parameters
+    resp = rds_data.execute_statement(**kwargs)
     cols = [c["name"] for c in resp["columnMetadata"]]
     rows = []
     for rec in resp["records"]:
@@ -90,11 +93,13 @@ def main():
         print(f"Namespace exists: {NAMESPACE}")
 
     # Discover tables
-    tables_rows = query(rds_data, cluster_arn, secret_arn, f"""
+    # Schema name is a WHERE-clause string literal → bind as a named parameter
+    # (behavior-identical, silences Bandit B608).
+    tables_rows = query(rds_data, cluster_arn, secret_arn, """
         SELECT table_name FROM information_schema.tables
-        WHERE table_schema = '{args.schema}' AND table_type = 'BASE TABLE'
+        WHERE table_schema = :schema AND table_type = 'BASE TABLE'
         ORDER BY table_name
-    """)
+    """, parameters=[{"name": "schema", "value": {"stringValue": args.schema}}])
     tables = [r["table_name"] for r in tables_rows]
     if args.tables:
         allowed = {t.strip() for t in args.tables.split(",")}
@@ -109,23 +114,33 @@ def main():
     results = []
     for tbl in tables:
         # Get columns
-        col_rows = query(rds_data, cluster_arn, secret_arn, f"""
+        # Schema and table names are WHERE-clause string literals → bind as named
+        # parameters (behavior-identical, silences Bandit B608).
+        col_rows = query(rds_data, cluster_arn, secret_arn, """
             SELECT column_name, data_type, is_nullable
             FROM information_schema.columns
-            WHERE table_schema = '{args.schema}' AND table_name = '{tbl}'
+            WHERE table_schema = :schema AND table_name = :table
             ORDER BY ordinal_position
-        """)
+        """, parameters=[
+            {"name": "schema", "value": {"stringValue": args.schema}},
+            {"name": "table", "value": {"stringValue": tbl}},
+        ])
 
         # Get primary keys
-        pk_rows = query(rds_data, cluster_arn, secret_arn, f"""
+        # Schema and table names are WHERE-clause string literals → bind as named
+        # parameters (behavior-identical, silences Bandit B608).
+        pk_rows = query(rds_data, cluster_arn, secret_arn, """
             SELECT kcu.column_name
             FROM information_schema.table_constraints tc
             JOIN information_schema.key_column_usage kcu
               ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
             WHERE tc.constraint_type = 'PRIMARY KEY'
-              AND tc.table_schema = '{args.schema}' AND tc.table_name = '{tbl}'
+              AND tc.table_schema = :schema AND tc.table_name = :table
             ORDER BY kcu.ordinal_position
-        """)
+        """, parameters=[
+            {"name": "schema", "value": {"stringValue": args.schema}},
+            {"name": "table", "value": {"stringValue": tbl}},
+        ])
         pk_cols = [r["column_name"] for r in pk_rows]
 
         # Build Iceberg schema

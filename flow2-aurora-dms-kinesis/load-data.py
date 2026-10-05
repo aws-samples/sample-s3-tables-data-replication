@@ -14,7 +14,7 @@ TOTAL_RECORDS = 2000
 FIRST_NAMES = ["James", "Mary", "John", "Patricia", "Robert", "Jennifer", "Michael", "Linda", "David", "Elizabeth"]
 LAST_NAMES = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez"]
 CITIES = ["New York", "Los Angeles", "Chicago", "Houston", "Phoenix", "Philadelphia", "San Antonio", "San Diego", "Dallas", "Austin"]
-DOMAINS = ["gmail.com", "yahoo.com", "outlook.com", "company.com", "example.com"]
+DOMAINS = ["example.com", "example.org", "example.net", "mail.example.org", "test.example.com"]
 
 
 def get_output(cfn, stack, key):
@@ -24,13 +24,16 @@ def get_output(cfn, stack, key):
     raise KeyError(f"{key} not found in {stack}")
 
 
-def run_sql(rds_data, cluster_arn, secret_arn, sql):
-    return rds_data.execute_statement(
-        resourceArn=cluster_arn,
-        secretArn=secret_arn,
-        database=DB_NAME,
-        sql=sql,
-    )
+def run_sql(rds_data, cluster_arn, secret_arn, sql, parameters=None):
+    kwargs = {
+        "resourceArn": cluster_arn,
+        "secretArn": secret_arn,
+        "database": DB_NAME,
+        "sql": sql,
+    }
+    if parameters is not None:
+        kwargs["parameters"] = parameters
+    return rds_data.execute_statement(**kwargs)
 
 
 def main():
@@ -64,7 +67,8 @@ def main():
     print(f"Inserting {TOTAL_RECORDS} customers...")
     batch_size = 100
     for batch_start in range(0, TOTAL_RECORDS, batch_size):
-        values = []
+        placeholders = []
+        parameters = []
         for i in range(batch_start, min(batch_start + batch_size, TOTAL_RECORDS)):
             fn = random.choice(FIRST_NAMES)
             ln = random.choice(LAST_NAMES)
@@ -73,10 +77,27 @@ def main():
             signup = f"2024-{random.randint(1,12):02d}-{random.randint(1,28):02d}"
             orders = random.randint(0, 50)
             spent = round(random.uniform(0, 5000), 2)
-            values.append(f"('{fn}','{ln}','{email}','{city}','{signup}',{orders},{spent})")
+            # Bind every row value as an RDS Data API named parameter (unique per-row
+            # suffix) so no Python value is concatenated into the SQL string.
+            placeholders.append(
+                f"(:fn{i},:ln{i},:email{i},:city{i},:signup{i},:orders{i},:spent{i})"
+            )
+            parameters.extend([
+                {"name": f"fn{i}", "value": {"stringValue": fn}},
+                {"name": f"ln{i}", "value": {"stringValue": ln}},
+                {"name": f"email{i}", "value": {"stringValue": email}},
+                {"name": f"city{i}", "value": {"stringValue": city}},
+                {"name": f"signup{i}", "value": {"stringValue": signup}},
+                {"name": f"orders{i}", "value": {"longValue": orders}},
+                {"name": f"spent{i}", "value": {"doubleValue": spent}},
+            ])
 
-        sql = f"INSERT INTO customers (first_name,last_name,email,city,signup_date,total_orders,total_spent) VALUES {','.join(values)}"
-        run_sql(rds_data, cluster_arn, secret_arn, sql)
+        sql = (
+            "INSERT INTO customers "
+            "(first_name,last_name,email,city,signup_date,total_orders,total_spent) "
+            f"VALUES {','.join(placeholders)}"
+        )
+        run_sql(rds_data, cluster_arn, secret_arn, sql, parameters=parameters)
 
         loaded = min(batch_start + batch_size, TOTAL_RECORDS)
         if loaded % 500 == 0 or loaded == TOTAL_RECORDS:
